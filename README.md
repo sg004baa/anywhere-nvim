@@ -121,9 +121,9 @@ vim.opt.clipboard = "unnamedplus"
 
 ## ログ
 
-`%LOCALAPPDATA%\anvi-data\log\anvi.log`。起動のたびに切り詰める。
+`%LOCALAPPDATA%\anvi-data\log\anvi.log`。起動時に前回分を `anvi.log.1` へ退避し、今回分は空から始める（保持は前回の 1 世代）。
 `RUST_LOG` を設定すればレベルを変えられる（既定は `info`）。
-不具合報告にはこのファイルを添えてほしい。書き戻しがおかしいときは
+不具合報告にはこのファイルを添えてほしい。PC 終了時の問題は次回起動後の `anvi.log.1` も添えてほしい。書き戻しがおかしいときは
 `captured route=... framework=...` の行が一次情報になる。
 
 ## 既知の限界

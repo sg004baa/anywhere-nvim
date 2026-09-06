@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anvi_core::clipboard::{Clipboard, Memory};
-use anvi_core::{HostEvent, NvimConfig, NvimHandles, NvimServer};
+use anvi_core::{HostEvent, NvimConfig, NvimHandles, NvimServer, SpawnPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,7 +64,7 @@ async fn start(appname: &str, clip: Arc<Memory>) -> (NvimServer, NvimHandles) {
         appname: appname.to_owned(),
         clipboard: clip as Arc<dyn Clipboard>,
     };
-    NvimServer::spawn(&cfg)
+    NvimServer::spawn(&cfg, &SpawnPolicy::default())
         .await
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e:#}", cfg.nvim_exe.display()))
 }

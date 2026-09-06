@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -29,6 +30,105 @@ const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
 const PORT_ATTEMPTS: u32 = 5;
 /// 握手の期限。ポートの奪い主に繋がると応答が返らないため、無応答で固まらせない。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Shared spawn/RPC cancellation policy. An OS query is reversible; application
+/// exit (including a confirmed OS shutdown) is not.
+#[derive(Debug)]
+pub struct SpawnPolicy {
+    state: AtomicU8,
+    system_shutting_down: fn() -> bool,
+}
+
+const QUERYING: u8 = 1;
+const EXITING: u8 = 2;
+
+impl Default for SpawnPolicy {
+    fn default() -> Self {
+        Self::new(|| false)
+    }
+}
+
+impl SpawnPolicy {
+    pub fn new(system_shutting_down: fn() -> bool) -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            system_shutting_down,
+        }
+    }
+
+    pub fn query_end_session(&self) {
+        self.state.fetch_or(QUERYING, Ordering::SeqCst);
+    }
+
+    pub fn cancel_end_session(&self) {
+        // Never clear EXITING, even if cancellation races an application exit.
+        self.state.fetch_and(!QUERYING, Ordering::SeqCst);
+    }
+
+    pub fn exit(&self) {
+        self.state.fetch_or(EXITING, Ordering::SeqCst);
+    }
+
+    pub fn is_exiting(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & EXITING != 0
+    }
+
+    pub fn check(&self) -> Result<(), SpawnCancelled> {
+        if self.state.load(Ordering::SeqCst) == 0 && !(self.system_shutting_down)() {
+            Ok(())
+        } else {
+            Err(SpawnCancelled)
+        }
+    }
+
+    /// Interrupt startup work when spawning becomes inhibited. Polling also
+    /// observes SM_SHUTTINGDOWN before our HWND receives its notification.
+    pub async fn run<T>(
+        &self,
+        operation: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.check()?;
+        tokio::select! {
+            biased;
+            cancelled = self.cancelled() => Err(cancelled.into()),
+            result = operation => {
+                self.check()?;
+                result
+            }
+        }
+    }
+
+    async fn cancelled(&self) -> SpawnCancelled {
+        loop {
+            if let Err(cancelled) = self.check() {
+                return cancelled;
+            }
+            tokio::time::sleep(CONNECT_INTERVAL).await;
+        }
+    }
+
+    /// Existing RPC work must survive a cancelled OS query, but must not keep
+    /// application teardown waiting on an unresponsive nvim.
+    pub async fn wait_for_exit(&self) {
+        while !self.is_exiting() {
+            tokio::time::sleep(CONNECT_INTERVAL).await;
+        }
+    }
+}
+
+/// Cancellation is not a failed launch: the controller retains pending recovery
+/// and retries only after the shutdown query has been cancelled.
+#[derive(Debug)]
+pub struct SpawnCancelled;
+
+impl std::fmt::Display for SpawnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nvim spawning is inhibited by shutdown")
+    }
+}
+
+impl std::error::Error for SpawnCancelled {}
 
 /// host が nvim へ書き込む側の型。`new_tcp` が返す writer に合わせて固定される。
 type HostWriter = Compat<WriteHalf<TcpStream>>;
@@ -81,7 +181,11 @@ impl NvimServer {
     ///
     /// ポートを奪われて nvim が bind に失敗した場合（TOCTOU、→ DESIGN §4.6）は、
     /// ポートを取り直して再試行する。
-    pub async fn spawn(cfg: &NvimConfig) -> anyhow::Result<(Self, NvimHandles)> {
+    pub async fn spawn(
+        cfg: &NvimConfig,
+        policy: &SpawnPolicy,
+    ) -> anyhow::Result<(Self, NvimHandles)> {
+        policy.check()?;
         let init_lua = cfg.runtime_dir.join("init.lua");
         if !init_lua.is_file() {
             bail!(
@@ -100,14 +204,19 @@ impl NvimServer {
         let mut failures = Vec::new();
 
         for attempt in 1..=PORT_ATTEMPTS {
+            policy.check()?;
             let port = pick_free_port().context("failed to pick a free TCP port for nvim")?;
             // spawn 自体の失敗（exe が無い等）は再試行で直らないので即座に返す。
             // `?` で抜けた場合も kill_on_drop により子は始末される。
-            let mut child = spawn_child(cfg, &init_lua, port)?;
+            let mut child = spawn_child(cfg, &init_lua, port, policy)?;
             drain_stderr(&mut child, port)?;
 
-            match attach(port, &mut child, &handler).await {
+            match attach(port, &mut child, &handler, policy).await {
                 Ok((nvim, io)) => {
+                    if let Err(cancelled) = policy.check() {
+                        io.abort();
+                        return Err(cancelled.into());
+                    }
                     let io_watch = watch_io(io, handler.host.clone());
                     return Ok((
                         Self {
@@ -123,6 +232,7 @@ impl NvimServer {
                     ));
                 }
                 Err(e) => {
+                    policy.check()?;
                     warn!(port, attempt, "nvim did not come up: {e:#}");
                     failures.push(format!("port {port}: {e:#}"));
                     // child はこのイテレーションの終わりに drop され、kill_on_drop で殺される。
@@ -219,14 +329,22 @@ impl NvimServer {
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.io_watch.abort();
         self.child
-            .kill()
-            .await
+            .start_kill()
             .context("failed to kill the nvim child process")?;
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.wait())
+            .await
+            .context("timed out waiting for the nvim child process to exit")?
+            .context("failed to reap the nvim child process")?;
         Ok(())
     }
 }
 
-fn spawn_child(cfg: &NvimConfig, init_lua: &Path, port: u16) -> anyhow::Result<Child> {
+fn spawn_child(
+    cfg: &NvimConfig,
+    init_lua: &Path,
+    port: u16,
+    policy: &SpawnPolicy,
+) -> anyhow::Result<Child> {
     let mut command = Command::new(&cfg.nvim_exe);
     // host は GUI サブシステムでコンソールを持たない。何も指定しないと nvim
     // （コンソールアプリ）が自分でコンソールウィンドウを開いてしまう。
@@ -252,15 +370,19 @@ fn spawn_child(cfg: &NvimConfig, init_lua: &Path, port: u16) -> anyhow::Result<C
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn nvim at {} (NVIM_APPNAME={})",
-                cfg.nvim_exe.display(),
-                cfg.appname
-            )
-        })
+        .kill_on_drop(true);
+    // Check at the actual process-creation boundary, not just before awaits or
+    // port retries. If shutdown races CreateProcess, immediately drop the child.
+    policy.check()?;
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn nvim at {} (NVIM_APPNAME={})",
+            cfg.nvim_exe.display(),
+            cfg.appname
+        )
+    })?;
+    policy.check()?;
+    Ok(child)
 }
 
 /// nvim の stderr を読み捨てずにログへ流す。bind 失敗の理由はここにしか出ない。
@@ -288,28 +410,34 @@ fn drain_stderr(child: &mut Child, port: u16) -> anyhow::Result<()> {
 type Attached = (Neovim<HostWriter>, JoinHandle<Result<(), Box<LoopError>>>);
 
 /// 接続して host のチャンネルを登録するまで。失敗はすべてポート再試行の理由になる。
-async fn attach(port: u16, child: &mut Child, handler: &EventHandler) -> anyhow::Result<Attached> {
+async fn attach(
+    port: u16,
+    child: &mut Child,
+    handler: &EventHandler,
+    policy: &SpawnPolicy,
+) -> anyhow::Result<Attached> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let (nvim, io) = connect(addr, child, handler).await?;
+    let (nvim, io) = connect(addr, child, handler, policy).await?;
 
     // ポートを奪われていると nvim ではない相手に繋がり、応答が返ってこない。
     // 期限を切らないと host の起動がここで永久に止まる（→ DESIGN §4.6）。
-    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, register_host(&nvim)).await;
+    let handshake = policy
+        .run(async {
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, register_host(&nvim))
+                .await
+                .with_context(|| {
+                    format!("the server at {addr} did not answer the handshake within {HANDSHAKE_TIMEOUT:?}")
+                })?
+        })
+        .await;
     match handshake {
-        Ok(Ok(chan)) => {
+        Ok(chan) => {
             debug!(port, chan, "registered the host channel with nvim");
             Ok((nvim, io))
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             io.abort();
             Err(e)
-        }
-        Err(_) => {
-            io.abort();
-            Err(anyhow!(
-                "the server at {addr} did not answer nvim_get_api_info within \
-                 {HANDSHAKE_TIMEOUT:?}; something other than nvim may hold the port"
-            ))
         }
     }
 }
@@ -318,10 +446,12 @@ async fn connect(
     addr: SocketAddr,
     child: &mut Child,
     handler: &EventHandler,
+    policy: &SpawnPolicy,
 ) -> anyhow::Result<Attached> {
     let mut last_err = None;
 
     for _ in 0..CONNECT_ATTEMPTS {
+        policy.check()?;
         if let Some(status) = child
             .try_wait()
             .context("failed to poll the nvim child process")?
@@ -329,11 +459,24 @@ async fn connect(
             // bind に失敗して即死した（→ DESIGN §4.6）。ポートを取り直せば直りうる。
             bail!("nvim exited before accepting a connection ({status})");
         }
-        match nvim_rs::create::tokio::new_tcp(addr, handler.clone()).await {
+        let connected = tokio::select! {
+            biased;
+            cancelled = policy.cancelled() => return Err(cancelled.into()),
+            result = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                nvim_rs::create::tokio::new_tcp(addr, handler.clone()),
+            ) => result.context("timed out connecting to nvim")?,
+        };
+        match connected {
             Ok(attached) => return Ok(attached),
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(CONNECT_INTERVAL).await;
+                policy
+                    .run(async {
+                        tokio::time::sleep(CONNECT_INTERVAL).await;
+                        Ok(())
+                    })
+                    .await?;
             }
         }
     }
@@ -588,12 +731,141 @@ fn string_field(fields: &[(Value, Value)], event: &str, key: &str) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{NvimConfig, NvimServer, parse_clipboard_set, parse_notification};
+    use super::{
+        NvimConfig, NvimServer, SpawnCancelled, SpawnPolicy, parse_clipboard_set,
+        parse_notification,
+    };
     use crate::clipboard::Memory;
     use crate::event::HostEvent;
     use rmpv::Value;
     use std::path::PathBuf;
     use std::sync::Arc;
+    #[test]
+    fn cancelled_session_query_resumes_but_cannot_clear_application_exit() {
+        let policy = SpawnPolicy::default();
+        policy.query_end_session();
+        assert!(policy.check().is_err());
+        assert!(!policy.is_exiting());
+        policy.cancel_end_session();
+        assert!(policy.check().is_ok());
+        policy.exit();
+        policy.query_end_session();
+        policy.cancel_end_session();
+        assert!(policy.is_exiting());
+        assert!(policy.check().is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_rechecks_policy_after_the_operation_completes() {
+        let policy = SpawnPolicy::default();
+        let err = policy
+            .run(async {
+                policy.query_end_session();
+                Ok(42)
+            })
+            .await
+            .unwrap_err();
+        assert!(err.is::<SpawnCancelled>());
+        policy.cancel_end_session();
+        assert_eq!(policy.run(async { Ok(42) }).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn existing_rpc_waits_survive_queries_but_stop_on_exit() {
+        let policy = SpawnPolicy::default();
+        policy.query_end_session();
+        let result = tokio::select! {
+            biased;
+            () = policy.wait_for_exit() => "cancelled",
+            () = std::future::ready(()) => "completed",
+        };
+        assert_eq!(result, "completed");
+        policy.exit();
+        tokio::time::timeout(std::time::Duration::from_secs(1), policy.wait_for_exit())
+            .await
+            .expect("irreversible exit must release a blocked RPC wait");
+    }
+
+    #[tokio::test]
+    async fn system_shutdown_inhibits_even_initial_spawn_without_a_query() {
+        let cfg = NvimConfig {
+            nvim_exe: PathBuf::from("/nonexistent/nvim"),
+            runtime_dir: PathBuf::from("/nonexistent/runtime"),
+            appname: "anvi-test".to_owned(),
+            clipboard: Arc::new(Memory::default()),
+        };
+        let err = NvimServer::spawn(&cfg, &SpawnPolicy::new(|| true))
+            .await
+            .unwrap_err();
+        assert!(err.is::<SpawnCancelled>());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_query_cancels_a_live_spawn_without_retrying_then_can_resume() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let dir =
+            std::env::temp_dir().join(format!("anvi-spawn-cancellation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let exe = dir.join("fake-nvim");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\n\
+             dir=\"${5%/*}\"\n\
+             printf x >> \"$dir/attempts\"\n\
+             : > \"$dir/ready\"\n\
+             while [ ! -f \"$dir/release\" ]; do sleep 0.01; done\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(dir.join("init.lua"), "-- fake\n").unwrap();
+        let cfg = NvimConfig {
+            nvim_exe: exe,
+            runtime_dir: dir.clone(),
+            appname: "anvi-test".to_owned(),
+            clipboard: Arc::new(Memory::default()),
+        };
+        let policy = Arc::new(SpawnPolicy::default());
+        let spawn_cfg = cfg.clone();
+        let spawn_policy = Arc::clone(&policy);
+        let pending =
+            tokio::spawn(async move { NvimServer::spawn(&spawn_cfg, &spawn_policy).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the fake child must enter the first connection attempt");
+        policy.query_end_session();
+        std::fs::write(dir.join("release"), "").unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("query must interrupt the live connection attempt")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.is::<SpawnCancelled>());
+        assert_eq!(std::fs::read(dir.join("attempts")).unwrap(), b"x");
+
+        policy.cancel_end_session();
+        let err = NvimServer::spawn(&cfg, &policy).await.unwrap_err();
+        assert!(!err.is::<SpawnCancelled>(), "{err:#}");
+        assert_eq!(
+            std::fs::read(dir.join("attempts")).unwrap(),
+            vec![b'x'; 1 + super::PORT_ATTEMPTS as usize],
+            "after cancellation, ordinary failed-child port retries must work again",
+        );
+    }
 
     fn s(text: &str) -> Value {
         Value::from(text)
@@ -757,7 +1029,7 @@ mod tests {
             appname: "anvi-test".to_string(),
             clipboard: Arc::new(Memory::default()),
         };
-        let err = NvimServer::spawn(&cfg)
+        let err = NvimServer::spawn(&cfg, &SpawnPolicy::default())
             .await
             .expect_err("a missing init.lua must not be tolerated")
             .to_string();
@@ -776,7 +1048,7 @@ mod tests {
             appname: "anvi-test".to_string(),
             clipboard: Arc::new(Memory::default()),
         };
-        let err = NvimServer::spawn(&cfg)
+        let err = NvimServer::spawn(&cfg, &SpawnPolicy::default())
             .await
             .expect_err("spawning a nonexistent executable must fail")
             .to_string();
