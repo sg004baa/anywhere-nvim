@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+use anvi_core::SpawnPolicy;
 use anvi_core::ui::input::{Mods, encode_key, encode_text};
 use anvi_core::ui::{UiState, redraw};
 use anyhow::Context as _;
@@ -32,6 +33,7 @@ use crate::gui::font::{FontSpec, GuiFont};
 use crate::gui::ime::ImeState;
 use crate::gui::render::Renderer;
 use crate::hotkey::Hotkeys;
+use crate::shutdown::SessionEndHook;
 use crate::tray::Tray;
 
 /// 既定のグリッド。ウィンドウの初期サイズも `nvim_ui_attach` もこれで揃える。
@@ -84,6 +86,8 @@ pub enum UserEvent {
     Hide,
     Focus,
     Quit,
+    /// Initial child startup failed; preserve the error as the process result.
+    Fatal(anyhow::Error),
 }
 
 /// 他スレッド・他クレートのコールバックから [`UserEvent`] を投げるための握り。
@@ -118,6 +122,7 @@ pub struct GuiBoot {
     pub tx: Sender<Cmd>,
     pub tray: Tray,
     pub hotkeys: Hotkeys,
+    pub policy: Arc<SpawnPolicy>,
     /// 現行ペアの世代。controller の `restart_pair` が進める。旧ペアの `Redraw` を
     /// 捨てる判定に使う。
     pub generation: Arc<AtomicU64>,
@@ -139,11 +144,14 @@ pub fn run(event_loop: EventLoop<UserEvent>, boot: GuiBoot) -> anyhow::Result<()
         ime: ImeState::default(),
         mods: Mods::default(),
         generation: boot.generation,
+        policy: boot.policy,
         grid: DEFAULT_GRID,
         draw_failures: 0,
         fatal: None,
     };
     let result = event_loop.run_app(&mut app);
+    app.policy.exit();
+    app.send(Cmd::Exit);
 
     // ハンドラは `Result` を返せないので、続行できない失敗は `fatal` に積んで
     // `exit()` している。ループ自体のエラーより、そちらが本当の原因。
@@ -155,6 +163,8 @@ pub fn run(event_loop: EventLoop<UserEvent>, boot: GuiBoot) -> anyhow::Result<()
 
 /// ウィンドウと、その上のレンダーターゲット。生成は `resumed` まで待つ。
 struct Surface {
+    // Fields drop in declaration order: detach the subclass before HWND teardown.
+    _session_end: SessionEndHook,
     window: Window,
     renderer: Renderer,
     /// `focus::set_foreground` に渡す生の HWND。
@@ -177,6 +187,7 @@ struct App {
     grid: (u16, u16),
     /// 現行ペアの世代。[`UserEvent::Redraw`] の世代照合に使う。
     generation: Arc<AtomicU64>,
+    policy: Arc<SpawnPolicy>,
     draw_failures: u32,
     /// ループを畳む原因になった致命的エラー。[`run`] の戻り値になる。
     fatal: Option<anyhow::Error>,
@@ -189,7 +200,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         match self.create_surface(event_loop) {
-            Ok(surface) => self.surface = Some(surface),
+            Ok(surface) => {
+                self.surface = Some(surface);
+                // No initial CreateProcess before synchronous notifications can
+                // reach the real HWND procedure.
+                self.send(Cmd::Start);
+            }
             Err(err) => self.die(event_loop, err),
         }
     }
@@ -214,8 +230,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ToggleAutostart => self.tray.apply_autostart(),
             UserEvent::Quit => {
                 tracing::info!("exit requested");
+                self.policy.exit();
+                self.send(Cmd::Exit);
                 event_loop.exit();
             }
+            UserEvent::Fatal(err) => self.die(event_loop, err),
         }
     }
 
@@ -262,11 +281,15 @@ impl App {
     fn die(&mut self, event_loop: &ActiveEventLoop, err: anyhow::Error) {
         tracing::error!(%err, "the gui cannot continue");
         self.fatal = Some(err);
+        self.policy.exit();
+        self.send(Cmd::Exit);
         event_loop.exit();
     }
 
     fn send(&self, cmd: Cmd) {
-        if let Err(err) = self.tx.send(cmd) {
+        if let Err(err) = self.tx.send(cmd)
+            && !self.policy.is_exiting()
+        {
             tracing::error!(cmd = ?err.0, "the controller is gone; command dropped");
         }
     }
@@ -280,6 +303,7 @@ impl App {
     fn create_surface(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<Surface> {
         let window = window::create(event_loop, self.grid)?;
         let hwnd = window::hwnd_of(&window)?;
+        let session_end = SessionEndHook::install(hwnd, Arc::clone(&self.policy), self.tx.clone())?;
         let renderer = Renderer::new(hwnd, &self.font, window.scale_factor())
             .context("failed to create the Direct2D renderer")?;
         // 暫定サイズで作ったウィンドウを、実測したセル寸法へ合わせ直す。
@@ -292,6 +316,7 @@ impl App {
         );
         window.set_ime_allowed(self.ui.mode.accepts_text_input());
         Ok(Surface {
+            _session_end: session_end,
             window,
             renderer,
             hwnd,

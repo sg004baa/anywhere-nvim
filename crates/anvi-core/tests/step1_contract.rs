@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anvi_core::clipboard::Memory;
-use anvi_core::{Applied, HostEvent, NvimConfig, NvimServer, Phase, Session};
+use anvi_core::{Applied, HostEvent, NvimConfig, NvimServer, Phase, Session, SpawnPolicy};
 use nvim_rs::rpc::handler::Dummy;
 use tokio::io::WriteHalf;
 use tokio::net::TcpStream;
@@ -71,7 +71,7 @@ async fn start(appname: &str) -> (NvimServer, UnboundedReceiver<HostEvent>, Clie
         appname: appname.to_owned(),
         clipboard: Arc::new(Memory::default()),
     };
-    let (server, handles) = NvimServer::spawn(&cfg)
+    let (server, handles) = NvimServer::spawn(&cfg, &SpawnPolicy::default())
         .await
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e:#}", cfg.nvim_exe.display()));
     let (client, _io) = nvim_rs::create::tokio::new_tcp(("127.0.0.1", server.port()), Dummy::new())

@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anvi_core::clipboard::Memory;
-use anvi_core::{HostEvent, NvimConfig, NvimHandles, NvimServer};
+use anvi_core::{HostEvent, NvimConfig, NvimHandles, NvimServer, SpawnPolicy};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -60,7 +60,7 @@ async fn start(appname: &str) -> (NvimServer, NvimHandles) {
         appname: appname.to_owned(),
         clipboard: Arc::new(Memory::default()),
     };
-    NvimServer::spawn(&cfg)
+    NvimServer::spawn(&cfg, &SpawnPolicy::default())
         .await
         .unwrap_or_else(|e| panic!("failed to spawn {}: {e:#}", cfg.nvim_exe.display()))
 }

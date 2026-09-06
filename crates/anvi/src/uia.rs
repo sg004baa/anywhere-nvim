@@ -6,9 +6,11 @@
 //! プレーンなデータ (行配列 / HWND) だけである。したがって `unsafe impl Send` は不要。
 
 use std::ffi::c_void;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
+use anvi_core::SpawnPolicy;
 use anvi_core::text::{to_crlf, to_lines};
 use anyhow::{Context as _, Result, anyhow, bail};
 use windows::Win32::Foundation::HWND;
@@ -68,11 +70,12 @@ enum Reply {
 pub struct Uia {
     jobs: Sender<Job>,
     replies: Receiver<Reply>,
+    policy: Arc<SpawnPolicy>,
 }
 
 impl Uia {
     /// MTA スレッドを起動し、`CUIAutomation` の生成まで済ませる。
-    pub fn start() -> Result<Self> {
+    pub fn start(policy: Arc<SpawnPolicy>) -> Result<Self> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -86,6 +89,7 @@ impl Uia {
             Ok(Ok(())) => Ok(Self {
                 jobs: job_tx,
                 replies: reply_rx,
+                policy,
             }),
             Ok(Err(e)) => Err(e).context("UIA スレッドの初期化に失敗"),
             Err(_) => bail!("UIA スレッドが初期化結果を返さずに終了した"),
@@ -111,12 +115,26 @@ impl Uia {
     }
 
     fn request(&self, job: Job) -> Result<Reply> {
+        if self.policy.is_exiting() {
+            bail!("application is exiting");
+        }
         self.jobs
             .send(job)
             .map_err(|_| anyhow!("UIA スレッドが既に終了している"))?;
-        self.replies
-            .recv()
-            .map_err(|_| anyhow!("UIA スレッドが応答を返さずに終了した"))
+        loop {
+            // Only irreversible exit may abandon a reply: a cancelled Windows
+            // query must leave request/reply ordering and user edits intact.
+            if self.policy.is_exiting() {
+                bail!("application is exiting");
+            }
+            match self.replies.recv_timeout(Duration::from_millis(20)) {
+                Ok(reply) => return Ok(reply),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("UIA スレッドが応答を返さずに終了した");
+                }
+            }
+        }
     }
 }
 
@@ -488,11 +506,56 @@ unsafe fn read_i32_array(array: *mut SAFEARRAY) -> Option<Vec<i32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EligibilityCapabilities, is_eligible_target};
+    use super::{EligibilityCapabilities, Reply, Uia, is_eligible_target};
+    use anvi_core::SpawnPolicy;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
     use windows::Win32::UI::Accessibility::{
         UIA_ButtonControlTypeId, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
         UIA_EditControlTypeId,
     };
+
+    #[test]
+    fn provider_wait_survives_a_query_but_does_not_block_application_exit() {
+        let policy = Arc::new(SpawnPolicy::default());
+        let (job_tx, job_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let uia = Uia {
+            jobs: job_tx,
+            replies: reply_rx,
+            policy: Arc::clone(&policy),
+        };
+        let worker = std::thread::spawn(move || {
+            result_tx.send(uia.capture()).unwrap();
+            result_tx.send(uia.capture()).unwrap();
+        });
+        job_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        policy.query_end_session();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        policy.cancel_end_session();
+        reply_tx.send(Reply::Capture(Ok(None))).unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+
+        job_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        policy.exit();
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("an unresponsive provider must not hold up process exit")
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
 
     fn capabilities(
         control_type: i32,

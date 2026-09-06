@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anvi_core::clipboard::Memory;
-use anvi_core::{Applied, HostEvent, NvimConfig, NvimServer, Session, text};
+use anvi_core::{Applied, HostEvent, NvimConfig, NvimServer, Session, SpawnPolicy, text};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     // UI クライアントとしてはアタッチしない（このサンプルは状態契約だけを見る）。
     // `redraw` の受け口は落としてよく、サーバ側は debug ログを出して捨てる。
-    let (mut server, handles) = NvimServer::spawn(&cfg).await?;
+    let (mut server, handles) = NvimServer::spawn(&cfg, &SpawnPolicy::default()).await?;
     let mut events = handles.host;
     let mut session = Session::default();
 

@@ -16,5 +16,5 @@ pub mod ui;
 
 pub use clipboard::{Clipboard, RegType};
 pub use event::HostEvent;
-pub use server::{NvimConfig, NvimHandles, NvimServer};
+pub use server::{NvimConfig, NvimHandles, NvimServer, SpawnCancelled, SpawnPolicy};
 pub use session::{Applied, Phase, Session};
