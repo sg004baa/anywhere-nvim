@@ -126,6 +126,32 @@ async fn pastes_what_windows_put_on_the_clipboard() {
     server.shutdown().await.expect("shutdown");
 }
 
+/// GUI の Ctrl+Shift+V は insert mode で `+` レジスタを経由して貼り付ける。
+#[tokio::test]
+async fn ctrl_shift_v_pastes_at_the_insert_cursor() {
+    let clip = Arc::new(Memory::default());
+    clip.put("hello");
+    let (mut server, mut handles) =
+        start("anvi-test-clipboard-ctrl-shift-v", Arc::clone(&clip)).await;
+
+    server
+        .start_session(&["world".to_owned()], None)
+        .await
+        .expect("start_session");
+    server
+        .input("i<C-S-V><Esc>:w<CR>")
+        .await
+        .expect("send insert-mode paste");
+
+    assert_eq!(
+        expect_session_write(&mut handles.host).await,
+        vec!["helloworld".to_owned()],
+        "Ctrl+Shift+V did not paste the + register at the insert cursor"
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
 /// `"+yy` した行はクリップボードに載る。行指向のヤンクでは nvim が `lines` の末尾に
 /// 空行を入れて渡してくるので、結合した結果は末尾 CRLF で終わる（二重にならない）。
 #[tokio::test]

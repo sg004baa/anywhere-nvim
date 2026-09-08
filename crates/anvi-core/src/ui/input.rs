@@ -94,6 +94,10 @@ impl Mods {
 /// 生のまま流すと同じキーが二重に入る。
 #[must_use]
 pub fn encode_key(key: Key, mods: Mods) -> Option<String> {
+    if matches!(key, Key::Char('v' | 'V')) && mods.ctrl && mods.shift && !mods.alt {
+        return Some("<C-S-V>".to_owned());
+    }
+
     match key {
         Key::Char(c) if c.is_control() => None,
         // Ctrl / Alt が絡むときだけ `<...>` にする。Shift 単独は文字そのものに
@@ -204,6 +208,15 @@ mod tests {
         assert_eq!(ch('A', SHIFT), some("A"));
         assert_eq!(ch('!', SHIFT), some("!"));
         assert_eq!(ch('あ', NONE), some("あ"));
+    }
+
+    #[test]
+    fn ctrl_shift_v_uses_a_distinct_canonical_notation() {
+        assert_eq!(ch('v', CTRL_SHIFT), some("<C-S-V>"));
+        assert_eq!(ch('V', CTRL_SHIFT), some("<C-S-V>"));
+        assert_eq!(ch('v', CTRL), some("<C-v>"));
+        assert_eq!(ch('v', ALT_CTRL), some("<M-C-v>"));
+        assert_eq!(ch('v', SHIFT), some("v"));
     }
 
     #[test]
