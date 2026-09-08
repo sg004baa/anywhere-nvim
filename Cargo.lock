@@ -73,7 +73,7 @@ checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
 name = "anvi"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anvi-core",
  "anyhow",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "anvi-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
