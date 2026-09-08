@@ -122,7 +122,7 @@ function M.enforce_contract()
   -- 1. キーマップ
   vim.keymap.set("n", "ZZ", "<Cmd>AnviWriteQuit<CR>")
   vim.keymap.set("n", "ZQ", "<Cmd>AnviQuit<CR>")
-
+  vim.keymap.set("i", "<C-S-v>", "<C-r>+")
   -- 2. :q 系の乗っ取り（網羅的ではない。抜けたら追加する）
   local function abbr(lhs, rhs)
     vim.cmd(([[cnoreabbrev <expr> %s (getcmdtype()==#':' && getcmdline()==#%q) ? %q : %q]]):format(lhs, lhs, rhs, lhs))

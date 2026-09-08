@@ -12,7 +12,10 @@
 //! [`crate::gui::ime::ImeState::composing`] と二重に効かせている）。
 
 use anvi_core::ui::input::{Key, Mods, NamedKey};
-use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamed};
+use winit::event::KeyEvent;
+use winit::keyboard::{
+    Key as WinitKey, KeyCode, ModifiersState, NamedKey as WinitNamed, PhysicalKey,
+};
 
 /// 修飾キーの現在値。Windows キー（`super`）は握らない。
 #[must_use]
@@ -24,10 +27,21 @@ pub fn mods(state: ModifiersState) -> Mods {
     }
 }
 
-/// 論理キー → nvim へ送れるキー。送れないものは `None`。
+/// winit のキーイベント → nvim へ送れるキー。送れないものは `None`。
+///
+/// `logical_key` はキーボード配列に依存するため、Windows の Ctrl+Shift+V は
+/// `physical_key` も見て特別扱いする。
 #[must_use]
-pub fn convert(key: &WinitKey) -> Option<Key> {
-    match key {
+pub fn convert(event: &KeyEvent, mods: Mods) -> Option<Key> {
+    if event.physical_key == PhysicalKey::Code(KeyCode::KeyV)
+        && mods.ctrl
+        && mods.shift
+        && !mods.alt
+    {
+        return Some(Key::Char('V'));
+    }
+
+    match &event.logical_key {
         WinitKey::Character(text) => {
             let mut chars = text.chars();
             let first = chars.next()?;

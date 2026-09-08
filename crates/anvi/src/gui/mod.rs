@@ -597,7 +597,7 @@ impl App {
             tracing::trace!("key dropped while composing");
             return;
         }
-        let Some(key) = keys::convert(&event.logical_key) else {
+        let Some(key) = keys::convert(event, self.mods) else {
             tracing::debug!(key = ?event.logical_key, "unmapped key dropped");
             return;
         };

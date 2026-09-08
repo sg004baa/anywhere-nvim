@@ -35,8 +35,8 @@ const PROVISIONAL_CELL: (f64, f64) = (8.0, 16.0);
 /// 編集ウィンドウを作る。**作った時点では見えないし前面にも来ない。**
 ///
 /// ホットキーが押されるまで画面に出てはいけないので `with_visible(false)`、
-/// 起動時にユーザーの作業を奪わないので `with_active(false)`、常駐アプリなので
-/// タスクバーにも出さない。
+/// 起動時にユーザーの作業を奪わないので `with_active(false)`。表示中はタスクバーに
+/// 出て、`Alt+Tab` の対象になる。
 ///
 /// タイトルバーは出さない（`with_decorations(false)`）。編集中の 1 行に
 /// システムの枠を被せる意味が無く、ウィンドウは対象アプリに重ねて出して `ZZ` / `ZQ`
@@ -58,7 +58,6 @@ pub fn create(event_loop: &ActiveEventLoop, grid: (u16, u16)) -> anyhow::Result<
             f64::from(cols) * PROVISIONAL_CELL.0,
             f64::from(rows) * PROVISIONAL_CELL.1,
         ))
-        .with_skip_taskbar(true)
         .with_no_redirection_bitmap(true);
     event_loop
         .create_window(attributes)
